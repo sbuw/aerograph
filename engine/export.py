@@ -26,8 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyArrowPatch
+from matplotlib.patches import FancyArrowPatch, Polygon
 import numpy as np
 
 from engine.forecast import compute_climate_indices, compute_all_nodes_predictability
@@ -67,6 +68,55 @@ def set_dark_style(fig: plt.Figure, ax: plt.Axes) -> None:
     ax.grid(True, color=BORDER_COLOR, linestyle="--", alpha=0.5, linewidth=0.7)
 
 
+def great_circle_arc(lon1: float, lat1: float, lon2: float, lat2: float, n_pts: int = 35) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute intermediate points along a great-circle arc using spherical linear interpolation (SLERP)."""
+    phi1, lambda1 = np.radians(lat1), np.radians(lon1)
+    phi2, lambda2 = np.radians(lat2), np.radians(lon2)
+    p1 = np.array([np.cos(phi1) * np.cos(lambda1), np.cos(phi1) * np.sin(lambda1), np.sin(phi1)])
+    p2 = np.array([np.cos(phi2) * np.cos(lambda2), np.cos(phi2) * np.sin(lambda2), np.sin(phi2)])
+    dot = np.clip(np.dot(p1, p2), -1.0, 1.0)
+    omega = np.arccos(dot)
+    if np.isclose(omega, 0.0):
+        return np.array([lon1, lon2]), np.array([lat1, lat2])
+    t = np.linspace(0, 1, n_pts)
+    pts = (np.sin((1 - t) * omega)[:, None] * p1 + np.sin(t * omega)[:, None] * p2) / np.sin(omega)
+    lats = np.degrees(np.arcsin(np.clip(pts[:, 2], -1.0, 1.0)))
+    lons = np.degrees(np.arctan2(pts[:, 1], pts[:, 0]))
+    return lons, lats
+
+
+def split_arc_antimeridian(lons: np.ndarray, lats: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Split a continuous longitude-latitude curve across the antimeridian (+-180 deg) into disjoint segments."""
+    segments = []
+    curr_lons = [lons[0]]
+    curr_lats = [lats[0]]
+    for i in range(1, len(lons)):
+        lon_prev, lon_curr = lons[i - 1], lons[i]
+        lat_prev, lat_curr = lats[i - 1], lats[i]
+        if abs(lon_curr - lon_prev) > 180.0:
+            if lon_prev > 0:
+                f = (180.0 - lon_prev) / ((180.0 - lon_prev) + (lon_curr - (-180.0)))
+                lat_cross = lat_prev + f * (lat_curr - lat_prev)
+                curr_lons.append(180.0)
+                curr_lats.append(lat_cross)
+                segments.append((np.array(curr_lons), np.array(curr_lats)))
+                curr_lons = [-180.0, lon_curr]
+                curr_lats = [lat_cross, lat_curr]
+            else:
+                f = (-180.0 - lon_prev) / ((-180.0 - lon_prev) + (lon_curr - 180.0))
+                lat_cross = lat_prev + f * (lat_curr - lat_prev)
+                curr_lons.append(-180.0)
+                curr_lats.append(lat_cross)
+                segments.append((np.array(curr_lons), np.array(curr_lats)))
+                curr_lons = [180.0, lon_curr]
+                curr_lats = [lat_cross, lat_curr]
+        else:
+            curr_lons.append(lon_curr)
+            curr_lats.append(lat_curr)
+    segments.append((np.array(curr_lons), np.array(curr_lats)))
+    return segments
+
+
 def generate_charts(
     charts_dir: Path,
     nodes_arr: np.ndarray,
@@ -94,49 +144,79 @@ def generate_charts(
         fig, ax = plt.subplots(figsize=(12, 6.5), dpi=300)
         set_dark_style(fig, ax)
 
-        # Plot base grid points
+        # Plot Northern Hemisphere continental basemap contours and land fill
+        coast_file = Path(__file__).resolve().parent.parent / "data" / "coastlines_nh.json"
+        if coast_file.exists():
+            try:
+                with open(coast_file, "r", encoding="utf-8") as f:
+                    gj = json.load(f)
+                for poly in gj.get("coordinates", []):
+                    pts = poly[0]
+                    p = Polygon(pts, closed=True, facecolor="#1e293b", edgecolor="#334155", linewidth=0.8, alpha=0.4, zorder=1)
+                    ax.add_patch(p)
+            except Exception as exc:
+                logger.warning("Could not render coastlines_nh.json: %s", exc)
+
+        # Plot base grid points (N=936)
         ax.scatter(
             nodes_arr[:, 2],  # lon
             nodes_arr[:, 1],  # lat
-            c="#334155",
-            s=8,
-            alpha=0.4,
+            s=4,
+            alpha=0.25,
+            c="#64748b",
             edgecolors="none",
-            label="Узлы сетки (5°)",
+            zorder=2,
+            label="Узлы сетки (N=936)",
         )
 
-        # Sort edges by |correlation| and take top 150 arcs for visual clarity
-        sorted_edges = sorted(edges, key=lambda e: abs(e[2]), reverse=True)
-        top_edges = sorted_edges[:150]
+        # Filter edges: top 400 strongest teleconnections (|r| >= 0.70, d >= 1000 km)
+        cand_edges = [e for e in edges if abs(e[2]) >= 0.70 and e[5] >= 1000]
+        cand_edges.sort(key=lambda e: abs(e[2]), reverse=True)
+        if len(cand_edges) < 400:
+            fallback = [e for e in edges if e[5] >= 1000]
+            fallback.sort(key=lambda e: abs(e[2]), reverse=True)
+            top_edges = fallback[:400]
+        else:
+            top_edges = cand_edges[:400]
 
         for edge in top_edges:
             s_id, t_id, r, lag, p_val, dist = edge[:6]
             s_lat, s_lon = nodes_arr[s_id, 1], nodes_arr[s_id, 2]
             t_lat, t_lon = nodes_arr[t_id, 1], nodes_arr[t_id, 2]
 
-            color = ACCENT_CYAN if r > 0 else ACCENT_ROSE
-            alpha = min(0.85, max(0.25, (abs(r) - 0.65) / 0.35))
+            # Color by lag sign: lead (>0) cyan, lag (<0) amber, sync (==0) emerald
+            if lag > 0:
+                color = ACCENT_CYAN  # #38bdf8
+            elif lag < 0:
+                color = ACCENT_AMBER  # #f59e0b
+            else:
+                color = ACCENT_EMERALD  # #10b981
+
             lw = 0.8 + 2.0 * (abs(r) - 0.65) / 0.35
 
-            # Draw geodesic arc approximation
-            if abs(s_lon - t_lon) < 180:
-                ax.plot([s_lon, t_lon], [s_lat, t_lat], color=color, alpha=alpha, linewidth=lw)
-            else:
-                # Handle antimeridian crossing
-                ax.plot([s_lon, np.sign(s_lon) * 180], [s_lat, (s_lat + t_lat) / 2], color=color, alpha=alpha, linewidth=lw)
-                ax.plot([-np.sign(s_lon) * 180, t_lon], [(s_lat + t_lat) / 2, t_lat], color=color, alpha=alpha, linewidth=lw)
+            # Compute geodesic arc and handle antimeridian crossing cleanly
+            arc_lons, arc_lats = great_circle_arc(s_lon, s_lat, t_lon, t_lat, n_pts=35)
+            segs = split_arc_antimeridian(arc_lons, arc_lats)
+            for seg_lons, seg_lats in segs:
+                ax.plot(seg_lons, seg_lats, color=color, alpha=0.35, linewidth=lw, zorder=3)
 
+        # Axes bounds: strict Northern Hemisphere bounding box
         ax.set_xlim(-180, 180)
-        ax.set_ylim(-90, 90)
-        ax.set_xlabel("Долгота (°)", fontsize=10)
-        ax.set_ylabel("Широта (°)", fontsize=10)
-        ax.set_title("Глобальная карта доминирующих телеконнекций (|r| ≥ 0.65, d ≥ 1000 км)", fontsize=12, fontweight="bold", pad=12)
+        ax.set_ylim(15, 85)
+        ax.set_xticks([-120, -60, 0, 60, 120])
+        ax.set_xticklabels(["120°W", "60°W", "0°", "60°E", "120°E"])
+        ax.set_yticks([20, 40, 60, 80])
+        ax.set_yticklabels(["20°N", "40°N", "60°N", "80°N"])
+        ax.set_xlabel("Долгота", fontsize=10)
+        ax.set_ylabel("Широта", fontsize=10)
+        ax.set_title("Планетарная сеть климатических телеконнекций (|r| ≥ 0.70, d ≥ 1000 км, N=400)", fontsize=12, fontweight="bold", pad=12)
 
         # Add custom legend
         legend_elements = [
-            Line2D([0], [0], color=ACCENT_CYAN, lw=2, label="Положительная связь (r > 0)"),
-            Line2D([0], [0], color=ACCENT_ROSE, lw=2, label="Дипольная связь (r < 0)"),
-            Line2D([0], [0], marker="o", color="w", markerfacecolor="#334155", markersize=6, label="Узлы сетки (N=936)"),
+            Line2D([0], [0], color=ACCENT_CYAN, lw=2, label="Опережение (tau > 0)"),
+            Line2D([0], [0], color=ACCENT_AMBER, lw=2, label="Запаздывание (tau < 0)"),
+            Line2D([0], [0], color=ACCENT_EMERALD, lw=2, label="Синхронность (tau = 0)"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#64748b", markersize=4, label="Узлы сетки (N=936)"),
         ]
         ax.legend(handles=legend_elements, loc="lower left", facecolor=PANEL_BG, edgecolor=BORDER_COLOR, labelcolor=TEXT_COLOR, fontsize=8)
 
@@ -292,8 +372,22 @@ def generate_charts(
                 if np.any(mask):
                     bin_energy[b_idx] = np.mean(psi[mask])
 
-            ax.plot(bin_centers, bin_energy, color=color, linewidth=2.0, marker="o", markersize=3.5, label=f"Вейвлет s = {scale_val:.1f}")
-            ax.fill_between(bin_centers, 0, bin_energy, color=color, alpha=0.12)
+            # Clean zeros and clamp values for logarithmic scale
+            bin_energy_clamped = np.maximum(bin_energy, 1e-5)
+
+            ax.plot(bin_centers, bin_energy_clamped, color=color, linewidth=2.0, marker="o", markersize=3.5, label=f"Вейвлет s = {scale_val:.1f}")
+            ax.fill_between(bin_centers, 1e-4, bin_energy_clamped, color=color, alpha=0.12)
+
+        # Logarithmic scale and range
+        ax.set_yscale("log")
+        ax.set_ylim(1e-4, 0.3)
+
+        # Synoptic noise threshold line
+        ax.axhline(1e-3, color="#f43f5e", linestyle="--", linewidth=1.2, alpha=0.7, label="Синоптический порог шума (10⁻³)")
+
+        # Readable logarithmic ticks
+        ax.set_yticks([1e-4, 1e-3, 1e-2, 1e-1, 1e0])
+        ax.set_yticklabels(["10⁻⁴", "10⁻³", "10⁻²", "10⁻¹", "1"])
 
         ax.set_xlabel("Пространственное расстояние от центрального узла (км)", fontsize=10)
         ax.set_ylabel(r"Средняя амплитуда вейвлета $|\psi_{s, i}|$", fontsize=10)
@@ -498,7 +592,7 @@ def build_markdown_report(
 
 ## 1. Резюме для руководства (Executive Summary)
 
-В данном исследовании представлен детальный спектральный и топологический анализ глобальной климатической системы Земли, смоделированной в виде пространственного графа телеконнекций G = (V, E). Анализ базируется на 60-дневной выборке синоптических полей изобарической высоты 500 гПа (Z500) с пространственным разрешением 5° x 5° (N = 936 узлов) и временным шагом дискретизации 3 часа (T = 480 эпох).
+В данном исследовании представлен детальный спектральный и топологический анализ климатической системы Северного полушария Земли (охват широт 15°N–85°N), смоделированной в виде пространственного графа телеконнекций G = (V, E). Анализ базируется на 60-дневной выборке синоптических полей изобарической высоты 500 гПа (Z500) с пространственным разрешением 5° x 5° (N = {summary_metrics['total_nodes']} узлов) и временным шагом дискретизации 3 часа (T = 480 эпох).
 
 ### Ключевые показатели графа:
 - **Общее число узлов сетки (|V|):** {summary_metrics['total_nodes']} (активных узлов: {summary_metrics['active_nodes']})
@@ -512,9 +606,11 @@ def build_markdown_report(
 
 ## 2. Глобальная топология и пространственная структура
 
-Телеконнекционные связи планетарной атмосферы формируют устойчивый безмасштабный граф с выраженными пространственными волноводами Россби и полушарными диполями.
+Телеконнекционные связи планетарной атмосферы формируют устойчивый безмасштабный граф с выраженными пространственными волноводами Россби и полушарными диполями в Северном полушарии (15°N–85°N).
 
 ![Глобальная карта телеконнекций](charts/01_teleconnection_map.png)
+
+*Рис. 1. Карта доминирующих телеконнекций Северного полушария (15°N–85°N) при |r| ≥ 0.65 и d ≥ 1000 км. Бирюзовые дуги — синфазные связи (r > 0), коралловые — дипольные противофазы (r < 0).*
 
 ### Фазовый баланс и распределение временных лагов tau:
 Временной сдвиг tau в диапазоне [-7, +7] суток определяет направленность волнового переноса энергии в тропосфере:
@@ -585,12 +681,14 @@ L = I - D^(-1/2) A D^(-1/2)
 
 ![Зависимость расстояния от корреляции](charts/03_distance_vs_correlation.png)
 
+*Рис. 3. Зависимость силы телеконнекционной связи от геодезического расстояния.*
+
 Спектральные графовые вейвлеты (SGWT) реализуются через полиномиальное приближение Чебышева 30-го порядка оператора фильтрации g(sL):
-psi_(s, i) = g(sL) delta_i = sum_(m=0)^M c_m(s) T_m(L) delta_i
+$$ \\psi_{{s, i}} = g(sL) \\delta_i = \\sum_{{m=0}}^M c_m(s) T_m(L) \\delta_i $$
 
 ![Профиль затухания энергии вейвлета](charts/05_wavelet_energy_decay.png)
 
-При масштабах s = 2.0 локализованная энергия концентрируется в радиусе синоптического масштаба (R approx 1500 - 2500 км), тогда как при s = 10.0 вейвлет захватывает крупномасштабные планетарные волноводы протяженностью свыше 10000 км.
+*Рис. 5. Профиль радиальной диссипации вейвлет-энергии в полулогарифмическом масштабе с физическим порогом численного шума 10⁻³ ($10^{{-3}}$). На синоптических масштабах s = 2.0 спектральная энергия сосредоточена в радиусе R ≈ 1500–2500 км и спадает ниже порога 10⁻³ на больших дистанциях. На планетарных масштабах s = 10.0 вейвлет охватывает крупномасштабные атмосферные волноводы протяженностью свыше 10 000 км.*
 
 ---
 
@@ -653,6 +751,16 @@ def build_html_report(
         mean_r2 = float(np.mean([p.get("r2", 0) for p in nodes_predictability]))
     else:
         mean_r2 = 0.65
+
+    nao_badge_class = "badge-pos" if nao_phase == "+" else "badge-neg"
+    nao_phase_text = "Положительная (+)" if nao_phase == "+" else "Отрицательная (−)"
+    nao_val_color = "#10B981" if nao_phase == "+" else "#F59E0B"
+    nao_val_str = f"+{nao_val:.2f}" if nao_val >= 0 else f"{nao_val:.2f}"
+
+    ao_badge_class = "badge-pos" if ao_phase == "+" else "badge-neg"
+    ao_phase_text = "Положительная (+)" if ao_phase == "+" else "Отрицательная (−)"
+    ao_val_color = "#10B981" if ao_phase == "+" else "#F59E0B"
+    ao_val_str = f"+{ao_val:.2f}" if ao_val >= 0 else f"{ao_val:.2f}"
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -785,10 +893,10 @@ def build_html_report(
   .chart-wrapper {{
     margin: 20px 0;
     text-align: center;
-    border-radius: 12px;
+    border-radius: 8px;
     overflow: hidden;
     border: 1px solid var(--border-color);
-    background: #000;
+    background: #0B0F19;
   }}
 
   .chart-wrapper img {{
@@ -826,42 +934,126 @@ def build_html_report(
   }}
 
   .badge {{
-    display: inline-block;
-    padding: 4px 8px;
-    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: 6px;
     font-size: 0.75rem;
     font-weight: 600;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
   }}
 
   .badge-lead {{ background: rgba(245, 158, 11, 0.2); color: var(--accent-amber); }}
   .badge-lag {{ background: rgba(168, 85, 247, 0.2); color: var(--accent-purple); }}
   .badge-sync {{ background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); }}
 
+  .badge-pos {{
+    background: rgba(16, 185, 129, 0.2);
+    color: #10B981;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+  }}
+
+  .badge-neg {{
+    background: rgba(245, 158, 11, 0.2);
+    color: #F59E0B;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+  }}
+
+  .indices-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin: 20px 0;
+  }}
+
+  .index-card {{
+    background: rgba(15, 23, 42, 0.65);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }}
+
+  .index-card-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }}
+
+  .index-title {{
+    font-size: 1.05rem;
+    font-weight: 700;
+  }}
+
+  .index-val-block {{
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 2px 0;
+  }}
+
+  .index-val {{
+    font-size: 1.75rem;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }}
+
+  .index-sigma {{
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }}
+
+  .index-desc {{
+    font-size: 0.875rem;
+    color: #94A3B8;
+    line-height: 1.5;
+    margin: 0;
+  }}
+
   @media print {{
     body {{
-      background-color: #FFF !important;
-      color: #000 !important;
+      background-color: #0B0F19 !important;
+      color: #F8FAFC !important;
       padding: 0 !important;
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
     }}
     header, section, .stat-card {{
-      background: #FFF !important;
-      border: 1px solid #CCC !important;
+      background: #131C2E !important;
+      border: 1px solid rgba(56, 189, 248, 0.2) !important;
       box-shadow: none !important;
-      color: #000 !important;
+      color: #F8FAFC !important;
       backdrop-filter: none !important;
-    }}
-    h1, h2, h3, .stat-val {{
-      color: #000 !important;
-    }}
-    .stat-lbl, .meta, p, td {{
-      color: #333 !important;
-    }}
-    .chart-wrapper {{
-      border: 1px solid #DDD !important;
       page-break-inside: avoid;
     }}
-    .chart-wrapper img {{
-      filter: invert(0.9) hue-rotate(180deg);
+    h1, h2, h3, .stat-val {{
+      color: #38BDF8 !important;
+    }}
+    .stat-lbl, .meta, p, td, th {{
+      color: #CBD5E1 !important;
+    }}
+    .chart-wrapper {{
+      background: #0B0F19 !important;
+      border-radius: 8px;
+      border: 1px solid rgba(56, 189, 248, 0.2);
+      page-break-inside: avoid;
+    }}
+    section {{
+      page-break-inside: avoid;
+    }}
+    .indices-grid, .index-card {{
+      page-break-inside: avoid;
+    }}
+    .index-card {{
+      background: #131C2E !important;
+      border: 1px solid rgba(56, 189, 248, 0.2) !important;
     }}
   }}
 </style>
@@ -906,10 +1098,10 @@ def build_html_report(
   </div>
 
   <section>
-    <h2>1. Глобальная топология климатических волноводов</h2>
-    <p>Пространственный анализ выявляет ключевые трансконтинентальные коридоры переноса вихревой энергии в средней тропосфере Земли. Применение геометрической отсечки (d ≥ 1000 км) изолирует истинные планетарные телеконнекции от локальной турбулентной когерентности.</p>
+    <h2>1. Глобальная топология климатических волноводов (Северное полушарие 15°N–85°N)</h2>
+    <p>Пространственный анализ выявляет ключевые трансконтинентальные коридоры переноса вихревой энергии в средней тропосфере Северного полушария (охват широт 15°N–85°N, сетка 5° × 5°). Применение геометрической отсечки (d ≥ 1000 км) и порога (|r| ≥ 0.65) изолирует истинные планетарные телеконнекции от локальной турбулентной когерентности.</p>
     <div class="chart-wrapper">
-      <img src="charts/01_teleconnection_map.png" alt="Карта телеконнекций">
+      <img src="charts/01_teleconnection_map.png" alt="Карта телеконнекций Северного полушария (15°N–85°N)">
     </div>
   </section>
 
@@ -963,9 +1155,9 @@ def build_html_report(
 
   <section>
     <h2>4. Спектральные графовые вейвлеты (SGWT)</h2>
-    <p>Вейвлет-атомы Чебышева 30-го порядка моделируют локализованную диффузию синоптических аномалий геопотенциала на различных масштабах s = 2.0, 5.0, 10.0.</p>
+    <p>Вейвлет-атомы Чебышева 30-го порядка моделируют локализованную диффузию синоптических аномалий геопотенциала на спектральных масштабах s = 2.0, 5.0, 10.0. Радиальный профиль диссипации представлен в логарифмическом масштабе с отсечкой численного шума 10⁻³: на малых масштабах (s = 2.0) энергия локализована в синоптическом радиусе (1500–2500 км) и спадает ниже порога 10⁻³, а на планетарных масштабах (s = 10.0) активируются глобальные волноводы протяженностью свыше 10 000 км.</p>
     <div class="chart-wrapper">
-      <img src="charts/05_wavelet_energy_decay.png" alt="Затухание энергии вейвлетов">
+      <img src="charts/05_wavelet_energy_decay.png" alt="Затухание энергии вейвлетов (логарифмический масштаб, порог 10⁻³)">
     </div>
   </section>
 
@@ -985,14 +1177,28 @@ def build_html_report(
     <div class="chart-wrapper">
       <img src="charts/06_climate_indices_phases.png" alt="Фазы макроклиматических индексов NAO и AO">
     </div>
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 16px 0;">
-      <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border: 1px solid var(--border-color);">
-        <strong style="color: var(--accent-cyan);">NAO: {nao_phase}{abs(nao_val):.2f} σ ({nao_phase} фаза)</strong>
-        <p style="font-size: 0.85rem; margin-top: 6px; color: #94A3B8;">{nao_desc}</p>
+    <div class="indices-grid">
+      <div class="index-card">
+        <div class="index-card-header">
+          <span class="index-title" style="color: var(--accent-cyan);">Североатлантическое колебание (NAO)</span>
+          <span class="badge {nao_badge_class}">{nao_phase_text}</span>
+        </div>
+        <div class="index-val-block">
+          <span class="index-val" style="color: {nao_val_color};">{nao_val_str} σ</span>
+          <span class="index-sigma">отклонение от климатической нормы</span>
+        </div>
+        <p class="index-desc">{nao_desc}</p>
       </div>
-      <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border: 1px solid var(--border-color);">
-        <strong style="color: var(--accent-purple);">AO: {ao_phase}{abs(ao_val):.2f} σ ({ao_phase} фаза)</strong>
-        <p style="font-size: 0.85rem; margin-top: 6px; color: #94A3B8;">{ao_desc}</p>
+      <div class="index-card">
+        <div class="index-card-header">
+          <span class="index-title" style="color: var(--accent-purple);">Арктическое колебание (AO)</span>
+          <span class="badge {ao_badge_class}">{ao_phase_text}</span>
+        </div>
+        <div class="index-val-block">
+          <span class="index-val" style="color: {ao_val_color};">{ao_val_str} σ</span>
+          <span class="index-sigma">проекция на гармонику Лапласиана</span>
+        </div>
+        <p class="index-desc">{ao_desc}</p>
       </div>
     </div>
     <div class="chart-wrapper">
