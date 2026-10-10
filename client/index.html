@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AeroGraph — Планетарные климатические телеконнекции и спектральный анализ атмосферы</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <meta name="description" content="AeroGraph: Интерактивная платформа спектрального анализа атмосферных телеконнекций, спектральных вейвлетов SGWT и глобальных климатических колебаний 500 гПа." />
+  <meta name="keywords" content="climate, teleconnections, atmosphere, geopotential height, spectral graph theory, wavelets, SGWT, NAO, Arctic Oscillation" />
+  <meta name="theme-color" content="#0b101b" />
+  <link rel="stylesheet" href="node_modules/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="node_modules/uplot/dist/uPlot.min.css" />
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <!-- Полноэкранная карта Leaflet -->
+  <div id="map"></div>
+
+  <!-- Верхняя панель управления (HUD) -->
+  <header class="hud-header glass-panel">
+    <div class="hud-brand">
+      <div class="brand-badge-row">
+        <svg class="brand-logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <circle cx="12" cy="12" r="9" stroke="url(#logo-grad)" stroke-width="1.8"/>
+          <path d="M4 12c4-3 12-3 16 0" stroke="#00f2fe" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M12 3c3 4 3 14 0 18" stroke="#f59e0b" stroke-width="1.2" stroke-linecap="round" stroke-dasharray="2 2"/>
+          <circle cx="8" cy="10" r="1.5" fill="#00f2fe"/>
+          <circle cx="16" cy="14" r="1.5" fill="#f59e0b"/>
+          <defs>
+            <linearGradient id="logo-grad" x1="0" y1="0" x2="24" y2="24">
+              <stop offset="0%" stop-color="#00f2fe"/>
+              <stop offset="100%" stop-color="#3b82f6"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        <span class="brand-badge">AEROGRAPH • 2D СПЕКТРАЛЬНЫЙ ГРАФ</span>
+      </div>
+      <h1>Планетарные климатические телеконнекции</h1>
+      <span class="subtitle">Геопотенциальная высота 500 гПа • Спектральные вейвлеты SGWT • Северное полушарие</span>
+    </div>
+
+    <div class="hud-controls">
+      <!-- Ползунок порога корреляции -->
+      <div class="control-group">
+        <div class="control-label">
+          <span>
+            Порог силы связи (|r|)
+            <span class="info-tip" data-tooltip="Коэффициент корреляции от 0 до 1. Чем выше значение, тем более устойчива и жестка климатическая связь между удалёнными точками планеты.">?</span>
+          </span>
+          <strong id="min-r-val">0.80</strong>
+        </div>
+        <input type="range" id="min-r-slider" min="0.65" max="0.95" step="0.01" value="0.80" />
+      </div>
+
+      <!-- Ползунок масштаба вейвлета s -->
+      <div class="control-group">
+        <div class="control-label">
+          <span>
+            Масштаб волны (s)
+            <span class="info-tip" data-tooltip="Масштаб спектрального вейвлета. Малые значения (1–3) показывают локальное возмущение в точке, большие (5–10) — как волна давления расходится по континентам.">?</span>
+          </span>
+          <strong id="scale-val">5.0</strong>
+        </div>
+        <input type="range" id="scale-slider" min="1.0" max="20.0" step="0.5" value="5.0" />
+      </div>
+
+      <!-- Фильтры по типу лага (опережение/запаздывание) -->
+      <div class="toggle-group lag-filters" id="lag-filter-group">
+        <button class="btn btn-lag active" data-lag="all" title="Показать все типы связей">Все</button>
+        <button class="btn btn-lag" data-lag="lead" title="Опережающие связи (&tau; &gt; 0, Циан)">Опережающие</button>
+        <button class="btn btn-lag" data-lag="lag" title="Запаздывающие связи (&tau; &lt; 0, Янтарь)">Запаздывающие</button>
+        <button class="btn btn-lag" data-lag="sync" title="Синхронные связи (&tau; = 0, Изумруд)">Синхронные</button>
+      </div>
+
+      <!-- Кнопки управления слоями -->
+      <div class="toggle-group">
+        <button id="btn-toggle-density" class="btn btn-toggle" title="Переключение между 120 сильнейшими связями и всеми отфильтрованными">Топ-120 связей</button>
+        <button id="btn-toggle-arcs" class="btn btn-toggle active" title="Включить/выключить дуги связей">Дуги связей</button>
+        <button id="btn-toggle-nodes" class="btn btn-toggle active" title="Включить/выключить узлы сетки">Узлы сетки</button>
+        <button id="btn-toggle-wavelet" class="btn btn-toggle active" title="Включить/выключить тепловое поле волн">Поле волн</button>
+        <button id="btn-reset" class="btn btn-secondary" title="Сбросить выбранный узел и вернуть обзор">Сбросить</button>
+        <button id="btn-export" class="btn btn-export" title="Экспорт полного аналитического отчета (ZIP)">📥 Экспорт отчёта</button>
+      </div>
+    </div>
+
+    <!-- Информационные метрики -->
+    <div class="hud-stats">
+      <div class="stat-pill highlight-cyan" id="stat-nao-pill">
+        <span class="stat-name">NAO <span class="info-tip" data-tooltip="Североатлантическое колебание. +: зональный перенос, мягкая зима в Европе; -: блокирующие антициклоны, арктические вторжения.">?</span></span>
+        <span class="stat-value" id="stat-nao-val">--</span>
+      </div>
+      <div class="stat-pill highlight-purple" id="stat-ao-pill">
+        <span class="stat-name">AO <span class="info-tip" data-tooltip="Арктическое колебание. +: полярный вихрь устойчив, мороз заперт в Арктике; -: дестабилизация вихря, выходы холода в средние широты.">?</span></span>
+        <span class="stat-value" id="stat-ao-val">--</span>
+      </div>
+      <div class="stat-pill">
+        <span class="stat-name">Активные узлы</span>
+        <span class="stat-value" id="stat-nodes">--</span>
+      </div>
+      <div class="stat-pill">
+        <span class="stat-name">Видимые связи</span>
+        <span class="stat-value" id="stat-edges">--</span>
+      </div>
+      <div class="stat-pill highlight">
+        <span class="stat-name">
+          Fiedler λ₂
+          <span class="info-tip" data-tooltip="Алгебраическая связность атмосферы. Показывает, насколько глобальная климатическая сеть едина и как быстро импульс давления передаётся по всему полушарию.">?</span>
+        </span>
+        <span class="stat-value" id="stat-fiedler">--</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Кнопка восстановления закрытой панели -->
+  <button id="btn-open-sidebar" class="sidebar-toggle-btn hidden" title="Открыть панель анализа">📊 Анализ и спектр</button>
+
+  <!-- Боковая панель телеметрии и спектра (с интерактивным ресайзером) -->
+  <aside id="sidebar" class="hud-sidebar glass-panel">
+    <!-- Ресайзер для изменения ширины панели мышью -->
+    <div id="sidebar-resizer" class="sidebar-resizer" title="Потяните для изменения ширины панели"></div>
+
+    <div class="sidebar-header">
+      <h2>Анализ узла и спектра</h2>
+      <button id="btn-close-sidebar" class="btn-icon" title="Скрыть/показать панель">&times;</button>
+    </div>
+
+    <!-- Карточка активного узла -->
+    <div id="node-info-card" class="panel-card">
+      <div class="node-meta-empty" id="node-meta-empty">
+        <div class="pulse-ring"></div>
+        <p>Нажмите на любую точку сетки на карте, чтобы исследовать входящие климатические телеконнекции и рассчитать вейвлеты графа (SGWT) в реальном времени.</p>
+      </div>
+
+      <div class="node-meta-content hidden" id="node-meta-content">
+        <div class="node-header">
+          <div class="node-id-tag">УЗЕЛ <span id="node-id-val">#652</span></div>
+          <div class="node-coords" id="node-coords-val">65.0°N, -160.0°E</div>
+        </div>
+        <div class="node-metrics-grid">
+          <div class="metric-box">
+            <span class="metric-lbl">Связей узла</span>
+            <span class="metric-num" id="node-degree-val">--</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-lbl">Пик волны</span>
+            <span class="metric-num" id="node-wavelet-peak">--</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-lbl">Энергия волны</span>
+            <span class="metric-num" id="node-wavelet-energy">--</span>
+          </div>
+        </div>
+
+        <div class="node-tabs">
+          <button id="tab-btn-links" class="node-tab-btn active">Связи узла</button>
+          <button id="tab-btn-forecast" class="node-tab-btn">Прогноз (1–5 дн.)</button>
+        </div>
+
+        <div id="tab-content-links">
+          <!-- Таблица входящих телеконнекций -->
+          <div class="incident-links-section">
+            <h4>Сильнейшие климатические связи</h4>
+            <div class="links-scroll-container">
+              <table class="links-table">
+                <thead>
+                  <tr>
+                    <th>Целевой регион</th>
+                    <th>|r|</th>
+                    <th>
+                      Лаг
+                      <span class="info-tip" data-tooltip="Задержка реакции в сутках. Положительный лаг означает, что погода в этой точке меняется раньше и влияет на удалённый регион.">?</span>
+                    </th>
+                    <th>Дистанция</th>
+                  </tr>
+                </thead>
+                <tbody id="incident-links-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-content-forecast" class="hidden">
+          <div class="forecast-header">
+            <div class="forecast-metric"><span class="lbl">Предикторов:</span> <strong id="fc-predictors">--</strong></div>
+            <div class="forecast-metric"><span class="lbl">Точность R²:</span> <strong id="fc-r2">--</strong></div>
+          </div>
+          <div id="forecast-chart-container" class="forecast-chart-box">
+            <!-- Canvas/SVG mini-chart -->
+          </div>
+          <div class="forecast-verdict-box" id="fc-verdict">Загрузка прогноза...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Карточка спектра Лапласиана -->
+    <div class="panel-card spectrum-card">
+      <div class="card-title-row">
+        <h3>Спектр Лапласиана графа (гармоники)</h3>
+        <span class="badge-mini">20 наименьших мод</span>
+      </div>
+      <p class="card-caption">Дискретные гармоники глобальной атмосферной сети (0 = &lambda;<sub>1</sub> &le; ... &le; &lambda;<sub>N</sub> &le; 2).</p>
+      <div id="spectrum-chart"></div>
+      <div class="spectrum-legend">
+        <span class="legend-dot trivial"></span> Нулевые моды
+        <span class="legend-dot fiedler"></span> <span class="legend-fiedler-text">Число Фидлера (λ₂)</span>
+        <span class="legend-dot harmonic"></span> Гармоники графа
+      </div>
+    </div>
+
+    <!-- Блок легенды -->
+    <div class="panel-card legend-card">
+      <h3>Обозначения связей и волн</h3>
+      <div class="legend-grid">
+        <div class="legend-item">
+          <span class="color-swatch cyan"></span>
+          <span>Опережающая связь (&tau; &gt; 0)</span>
+        </div>
+        <div class="legend-item">
+          <span class="color-swatch amber"></span>
+          <span>Запаздывающая связь (&tau; &lt; 0)</span>
+        </div>
+        <div class="legend-item">
+          <span class="color-swatch emerald"></span>
+          <span>Синхронная связь (&tau; = 0)</span>
+        </div>
+        <div class="legend-item">
+          <span class="color-swatch glow-cyan"></span>
+          <span>Положительная фаза волны (&psi; &gt; 0)</span>
+        </div>
+        <div class="legend-item">
+          <span class="color-swatch glow-coral"></span>
+          <span>Отрицательная фаза волны (&psi; &lt; 0)</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Глобальный контейнер всплывающих подсказок (вынесен в body с position: fixed) -->
+  <div id="global-tooltip" class="global-tooltip hidden"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,104 @@
+# ==============================================================================
+# AeroGraph Git Ignore Configuration
+# ==============================================================================
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+ENV.bak/
+env.bak/
+
+# Python Bytecode, Caching & Packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Climate Tensors & Binary Data Caches
+data/cache/*.npz
+data/cache/*.npy
+data/cache/*.zarr/
+*.npz
+*.npy
+!data/cache/.gitkeep
+
+# SQLite Databases & Ephemeral Logs
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite3
+data/*.sqlite
+*.sqlite3
+*.sqlite
+*.db
+!data/schema.sql
+
+# Export Artifacts & Reports
+exports/*.zip
+exports/*_report_*/
+!exports/.gitkeep
+
+# Node.js & Vite Client Artifacts
+node_modules/
+client/node_modules/
+client/dist/
+client/.vite/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDEs & Developer Tools
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+.settings/
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ...
+docs/TODO.md
+AGENTS.md
+.env
+.env.*
+!.env.example
+*.log
+profile.stats
